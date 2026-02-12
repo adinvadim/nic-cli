@@ -1,132 +1,68 @@
-# NIC.RU DNS Skill
+---
+name: nic-ru
+description: Управляй DNS-записями NIC.RU (RU-CENTER) через CLI nic-dns: проверяй зоны и записи, добавляй/удаляй записи, делай commit/rollback и помогай с DNS-01/почтовыми настройками. Используй, когда пользователь просит изменить DNS у доменов на NIC.RU или диагностировать проблемы с зонами/записями.
+metadata: {"openclaw":{"emoji":"🌐","homepage":"https://www.nic.ru/help/upload/file/API_DNS-hosting.pdf","requires":{"bins":["python3"]}}}
+---
 
-Управление DNS-записями через API NIC.RU (RU-CENTER).
+# NIC.RU DNS CLI (nic-dns)
 
-## Требования
+Используй CLI из этого skill:
+- `{baseDir}/scripts/nic-dns`
+- `{baseDir}/scripts/auth.sh`
 
-- Python 3.8+
-- Аккаунт NIC.RU с услугой DNS-хостинга
-- OAuth2 credentials (APP_LOGIN, APP_PASSWORD)
+Если `nic-dns` не в PATH, запускай через абсолютный путь: `{baseDir}/scripts/nic-dns ...`.
 
-## Авторизация
+## Быстрый рабочий поток
 
-Перед использованием нужно получить токен:
-
-```bash
-# Установи credentials
-export NIC_APP_LOGIN="your_app_login"
-export NIC_APP_PASSWORD="your_app_password"
-export NIC_USERNAME="your_nic_username"
-export NIC_PASSWORD="your_nic_password"
-
-# Или сохрани в файл
-cat > ~/.openclaw/workspace/.secrets/nic-ru-credentials <<EOF
-NIC_APP_LOGIN=your_app_login
-NIC_APP_PASSWORD=your_app_password
-NIC_USERNAME=your_nic_username
-NIC_PASSWORD=your_nic_password
-EOF
-
-# Получи токен
-nic-dns auth
-```
+1. Проверь, что есть доступ к учётным данным в `~/.openclaw/workspace/.secrets/nic-ru-credentials` или через env.
+2. Обнови токен: `nic-dns auth`.
+3. Проверь текущие записи: `nic-dns records <zone>`.
+4. Выполни изменение (`add`/`delete`/`update`).
+5. Обязательно зафиксируй: `nic-dns commit <zone>`.
+6. Повтори `records` и убедись, что запись появилась/исчезла.
 
 ## Команды
 
-### Список зон
 ```bash
+nic-dns auth
 nic-dns zones
+nic-dns records <zone>
+nic-dns add <zone> <TYPE> <name> <value> [ttl]
+nic-dns delete <zone> <record_id>
+nic-dns update <zone> <record_id> <value> [--ttl N]
+nic-dns commit <zone>
+nic-dns rollback <zone>
 ```
 
-### Список записей в зоне
-```bash
-nic-dns records example.ru
-```
+## Шаблоны изменений
 
-### Добавить запись
 ```bash
-# A запись
-nic-dns add example.ru A www 1.2.3.4 3600
+# A / root
+nic-dns add example.ru A @ 1.2.3.4 3600
 
 # CNAME
-nic-dns add example.ru CNAME blog www.example.ru 3600
+nic-dns add example.ru CNAME www app.example.com 3600
 
-# TXT (для верификации)
+# TXT (SPF / верификация)
 nic-dns add example.ru TXT @ "v=spf1 include:_spf.google.com ~all"
 
 # MX
-nic-dns add example.ru MX @ "10 mail.example.ru"
+nic-dns add example.ru MX @ "10 mx.yandex.net"
 
-# Wildcard
-nic-dns add example.ru A "*" 1.2.3.4
-```
-
-### Удалить запись
-```bash
-nic-dns delete example.ru 12345
-```
-
-### Обновить запись
-```bash
-nic-dns update example.ru 12345 5.6.7.8
-```
-
-### Применить изменения (commit)
-```bash
+# DNS-01
+nic-dns add example.ru TXT _acme-challenge "<challenge-token>"
 nic-dns commit example.ru
 ```
 
-## Типичные сценарии
+## Правила безопасности
 
-### Добавить A-запись для сервера
-```bash
-nic-dns add mysite.ru A @ 203.0.113.50
-nic-dns add mysite.ru A www 203.0.113.50
-nic-dns commit mysite.ru
-```
+- Никогда не печатай реальные логины/пароли/токены в ответ пользователю.
+- Никогда не коммить `~/.openclaw/workspace/.secrets/*`.
+- Перед публикацией репозитория проверяй tracked-файлы на секреты.
 
-### Настроить почту (MX + SPF)
-```bash
-nic-dns add mysite.ru MX @ "10 mx.yandex.net"
-nic-dns add mysite.ru TXT @ "v=spf1 redirect=_spf.yandex.net"
-nic-dns commit mysite.ru
-```
+## Диагностика
 
-### Верификация домена (Let's Encrypt DNS-01)
-```bash
-nic-dns add mysite.ru TXT _acme-challenge "токен_от_certbot"
-nic-dns commit mysite.ru
-# После верификации удалить
-nic-dns records mysite.ru | grep _acme-challenge
-nic-dns delete mysite.ru <record-id>
-nic-dns commit mysite.ru
-```
-
-### Wildcard SSL
-```bash
-nic-dns add mysite.ru TXT "_acme-challenge" "dns-challenge-token"
-nic-dns commit mysite.ru
-```
-
-## Важно
-
-1. **Commit обязателен** — изменения применяются только после `nic-dns commit <zone>`
-2. **TTL по умолчанию** — 3600 секунд (1 час)
-3. **@ означает корень** — запись для самого домена без поддомена
-4. **Токен живет 1 час** — после истечения нужен `nic-dns auth`
-
-## Устранение проблем
-
-### "Token expired"
-```bash
-nic-dns auth
-```
-
-### "Zone not found"
-Проверь список доступных зон:
-```bash
-nic-dns zones
-```
-
-### "Permission denied"
-Убедись что OAuth credentials правильные и у приложения есть права на DNS API.
+- `Token expired` → `nic-dns auth`.
+- `Zone not found` → `nic-dns zones`, затем проверь service/домен.
+- API 401/403 → проверь OAuth credentials и права приложения.
+- Изменение «не видно» → проверь, что был `commit`, и учитывай TTL/кэш DNS.

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 NIC.RU DNS API CLI tool for OpenClaw.
-
-API Documentation: https://www.nic.ru/help/upload/file/API_DNS-hosting.pdf
 """
 
 import argparse
@@ -20,10 +18,13 @@ except ImportError:
     print("Error: requests library required. Install: pip install requests", file=sys.stderr)
     sys.exit(1)
 
-
 # API endpoints
 OAUTH_URL = "https://api.nic.ru/oauth/token"
 API_BASE = "https://api.nic.ru/dns-master"
+
+# Constants
+KNOWN_SERVICES = ["DP2506122468", "DP2506128828", "DP2510072361"]
+DEFAULT_SERVICE = "DP2510072361"
 
 # Paths
 SECRETS_DIR = Path.home() / ".openclaw" / "workspace" / ".secrets"
@@ -31,17 +32,12 @@ TOKEN_FILE = SECRETS_DIR / "nic-ru-token.json"
 CREDENTIALS_FILE = SECRETS_DIR / "nic-ru-credentials"
 
 
-def load_credentials() -> dict:
-    """Load OAuth credentials from environment or file."""
+def load_credentials():
     creds = {}
-    
-    # Try environment first
     env_vars = ["NIC_APP_LOGIN", "NIC_APP_PASSWORD", "NIC_USERNAME", "NIC_PASSWORD"]
     for var in env_vars:
         if os.environ.get(var):
             creds[var] = os.environ[var]
-    
-    # Fall back to credentials file
     if len(creds) < 4 and CREDENTIALS_FILE.exists():
         with open(CREDENTIALS_FILE) as f:
             for line in f:
@@ -49,456 +45,172 @@ def load_credentials() -> dict:
                 if "=" in line and not line.startswith("#"):
                     key, value = line.split("=", 1)
                     creds[key.strip()] = value.strip()
-    
-    required = ["NIC_APP_LOGIN", "NIC_APP_PASSWORD", "NIC_USERNAME", "NIC_PASSWORD"]
-    missing = [r for r in required if r not in creds]
-    if missing:
-        print(f"Error: Missing credentials: {', '.join(missing)}", file=sys.stderr)
-        print(f"Set environment variables or create {CREDENTIALS_FILE}", file=sys.stderr)
-        sys.exit(1)
-    
     return creds
 
-
-def load_token() -> str | None:
-    """Load saved OAuth token if still valid."""
-    if not TOKEN_FILE.exists():
-        return None
-    
-    try:
-        with open(TOKEN_FILE) as f:
-            data = json.load(f)
-        
-        expires_at = datetime.fromisoformat(data["expires_at"])
-        if datetime.now() >= expires_at - timedelta(minutes=5):
-            return None  # Token expired or about to expire
-        
-        return data["access_token"]
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
-def save_token(access_token: str, expires_in: int):
-    """Save OAuth token to file."""
+def save_token(access_token, expires_in):
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
-    
     expires_at = datetime.now() + timedelta(seconds=expires_in)
-    data = {
-        "access_token": access_token,
-        "expires_at": expires_at.isoformat(),
-        "saved_at": datetime.now().isoformat()
-    }
-    
+    data = {"access_token": access_token, "expires_at": expires_at.isoformat()}
     with open(TOKEN_FILE, "w") as f:
         json.dump(data, f, indent=2)
-    
     TOKEN_FILE.chmod(0o600)
 
-
-def get_token(force_refresh: bool = False) -> str:
-    """Get valid OAuth token, refreshing if needed."""
-    if not force_refresh:
-        token = load_token()
-        if token:
-            return token
+def get_token(force_refresh=False):
+    if not force_refresh and TOKEN_FILE.exists():
+        try:
+            with open(TOKEN_FILE) as f:
+                data = json.load(f)
+            if datetime.now() < datetime.fromisoformat(data["expires_at"]) - timedelta(minutes=5):
+                return data["access_token"]
+        except: pass
     
     creds = load_credentials()
-    
-    # OAuth2 password grant
-    data = {
-        "grant_type": "password",
-        "username": creds["NIC_USERNAME"],
-        "password": creds["NIC_PASSWORD"],
-        "scope": "(GET|PUT|POST|DELETE):/dns-master/.+"
-    }
-    
     try:
-        resp = requests.post(
-            OAUTH_URL,
-            data=data,
-            auth=(creds["NIC_APP_LOGIN"], creds["NIC_APP_PASSWORD"]),
-            timeout=30
-        )
+        resp = requests.post(OAUTH_URL, data={
+            "grant_type": "password",
+            "username": creds["NIC_USERNAME"],
+            "password": creds["NIC_PASSWORD"],
+            "scope": "(GET|PUT|POST|DELETE):/dns-master/.+"
+        }, auth=(creds["NIC_APP_LOGIN"], creds["NIC_APP_PASSWORD"]), timeout=30)
         resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"Error: OAuth failed: {e}", file=sys.stderr)
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response: {e.response.text}", file=sys.stderr)
+    except Exception as e:
+        print(f"Auth failed: {e}", file=sys.stderr)
         sys.exit(1)
     
-    token_data = resp.json()
-    access_token = token_data["access_token"]
-    expires_in = token_data.get("expires_in", 3600)
-    
-    save_token(access_token, expires_in)
-    return access_token
+    data = resp.json()
+    save_token(data["access_token"], data.get("expires_in", 3600))
+    return data["access_token"]
 
-
-def api_request(method: str, endpoint: str, data: str = None, params: dict = None) -> ET.Element:
-    """Make authenticated API request, returns parsed XML."""
+def api_request(method, endpoint, data=None):
     token = get_token()
-    
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/xml" if data else "application/x-www-form-urlencoded"
     }
-    
-    url = f"{API_BASE}{endpoint}"
-    if params:
-        url += "?" + urlencode(params)
-    
     try:
-        resp = requests.request(
-            method,
-            url,
-            headers=headers,
-            data=data,
-            timeout=30
-        )
+        resp = requests.request(method, f"{API_BASE}{endpoint}", headers=headers, data=data, timeout=30)
         resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"Error: API request failed: {e}", file=sys.stderr)
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"Response: {e.response.text}", file=sys.stderr)
-        sys.exit(1)
-    
-    try:
         return ET.fromstring(resp.text)
-    except ET.ParseError:
-        print(f"Error: Invalid XML response: {resp.text[:500]}", file=sys.stderr)
+    except Exception as e:
+        print(f"API Error ({method} {endpoint}): {e}", file=sys.stderr)
+        if hasattr(e, 'response') and e.response is not None:
+            print(e.response.text, file=sys.stderr)
         sys.exit(1)
 
+def find_service_for_zone(zone):
+    for service in KNOWN_SERVICES:
+        try:
+            root = api_request("GET", f"/services/{service}/zones")
+            for z in root.findall(".//zone"):
+                if z.get("name") == zone or z.get("idn-name") == zone:
+                    return service
+        except: continue
+    return None
 
-def cmd_auth(args):
-    """Authenticate and save token."""
-    print("Authenticating with NIC.RU API...")
-    token = get_token(force_refresh=True)
-    print(f"✓ Token saved to {TOKEN_FILE}")
-    print(f"  Token prefix: {token[:20]}...")
-
-
-def cmd_zones(args):
-    """List available DNS zones."""
-    root = api_request("GET", "/services/")
-    
-    zones = []
-    for service in root.findall(".//zone"):
-        zone_name = service.get("name") or service.text
-        if zone_name:
-            zones.append(zone_name)
-    
-    # Also try alternative structure
-    for service in root.findall(".//service"):
-        zone_el = service.find("zone")
-        if zone_el is not None:
-            zone_name = zone_el.get("name") or zone_el.text
-            if zone_name and zone_name not in zones:
-                zones.append(zone_name)
-    
-    if not zones:
-        # Try to extract from idn-name or name attributes
-        for elem in root.iter():
-            for attr in ["idn-name", "name"]:
-                val = elem.get(attr)
-                if val and "." in val and val not in zones:
-                    zones.append(val)
-    
-    if args.json:
-        print(json.dumps({"zones": zones}, indent=2))
-    else:
-        if zones:
-            print("Available zones:")
-            for z in sorted(zones):
-                print(f"  {z}")
-        else:
-            print("No zones found. Check API response:")
-            print(ET.tostring(root, encoding="unicode")[:1000])
-
-
-def cmd_records(args):
-    """List DNS records for a zone."""
-    root = api_request("GET", f"/services/{args.zone}/zones/{args.zone}/records")
-    
-    records = []
-    for rr in root.findall(".//rr"):
-        record = {
-            "id": rr.get("id"),
-            "name": rr.findtext("name", ""),
-            "type": rr.findtext("type", ""),
-            "ttl": rr.findtext("ttl", ""),
-        }
-        
-        # Get record-specific data
-        rtype = record["type"].upper()
-        if rtype == "A":
-            record["value"] = rr.findtext("a", "")
-        elif rtype == "AAAA":
-            record["value"] = rr.findtext("aaaa", "")
-        elif rtype == "CNAME":
-            record["value"] = rr.findtext("cname", "")
-        elif rtype == "MX":
-            pref = rr.findtext("mx/preference", "")
-            exchange = rr.findtext("mx/exchange", "")
-            record["value"] = f"{pref} {exchange}"
-        elif rtype == "TXT":
-            txt_parts = [t.text for t in rr.findall("txt/string") if t.text]
-            record["value"] = " ".join(txt_parts)
-        elif rtype == "NS":
-            record["value"] = rr.findtext("ns", "")
-        elif rtype == "SOA":
-            record["value"] = "(SOA record)"
-        else:
-            # Generic fallback
-            record["value"] = rr.findtext(rtype.lower(), "")
-        
-        records.append(record)
-    
-    if args.json:
-        print(json.dumps({"zone": args.zone, "records": records}, indent=2))
-    else:
-        print(f"Records for {args.zone}:")
-        print(f"{'ID':<10} {'Type':<8} {'Name':<30} {'TTL':<8} {'Value'}")
-        print("-" * 100)
-        for r in records:
-            name = r["name"] or "@"
-            print(f"{r['id'] or '-':<10} {r['type']:<8} {name:<30} {r['ttl']:<8} {r['value']}")
-
-
-def build_rr_xml(rtype: str, name: str, value: str, ttl: int) -> str:
-    """Build XML for a resource record."""
+def build_rr_xml(rtype, name, value, ttl):
     rtype = rtype.upper()
     name_xml = f"<name>{name}</name>" if name and name != "@" else "<name/>"
     
-    if rtype == "A":
-        data = f"<a>{value}</a>"
-    elif rtype == "AAAA":
-        data = f"<aaaa>{value}</aaaa>"
-    elif rtype == "CNAME":
-        data = f"<cname>{value}</cname>"
+    data = ""
+    if rtype == "A": data = f"<a>{value}</a>"
+    elif rtype == "AAAA": data = f"<aaaa>{value}</aaaa>"
+    elif rtype == "CNAME": data = f"<cname><name>{value}</name></cname>"
     elif rtype == "MX":
-        # Value format: "10 mail.example.com"
         parts = value.split(None, 1)
-        pref = parts[0] if parts else "10"
-        exchange = parts[1] if len(parts) > 1 else value
-        data = f"<mx><preference>{pref}</preference><exchange>{exchange}</exchange></mx>"
-    elif rtype == "TXT":
-        # Handle TXT record value
-        data = f"<txt><string>{value}</string></txt>"
-    elif rtype == "NS":
-        data = f"<ns>{value}</ns>"
+        data = f"<mx><preference>{parts[0]}</preference><exchange>{parts[1]}</exchange></mx>"
+    elif rtype == "TXT": data = f"<txt><string>{value}</string></txt>"
+    elif rtype == "NS": data = f"<ns>{value}</ns>"
     elif rtype == "SRV":
-        # Value format: "priority weight port target"
-        parts = value.split()
-        if len(parts) >= 4:
-            data = f"<srv><priority>{parts[0]}</priority><weight>{parts[1]}</weight><port>{parts[2]}</port><target>{parts[3]}</target></srv>"
-        else:
-            data = f"<srv>{value}</srv>"
-    else:
-        # Generic
-        data = f"<{rtype.lower()}>{value}</{rtype.lower()}>"
+        p = value.split()
+        data = f"<srv><priority>{p[0]}</priority><weight>{p[1]}</weight><port>{p[2]}</port><target>{p[3]}</target></srv>"
     
     return f"""<?xml version="1.0" encoding="UTF-8"?>
-<request>
-  <rr-list>
-    <rr>
-      {name_xml}
-      <ttl>{ttl}</ttl>
-      <type>{rtype}</type>
-      {data}
-    </rr>
-  </rr-list>
-</request>"""
-
+<request><rr-list><rr>
+{name_xml}<ttl>{ttl}</ttl><type>{rtype}</type>{data}
+</rr></rr-list></request>"""
 
 def cmd_add(args):
-    """Add a DNS record."""
-    xml_data = build_rr_xml(args.type, args.name, args.value, args.ttl)
-    
-    root = api_request(
-        "PUT",
-        f"/services/{args.zone}/zones/{args.zone}/records",
-        data=xml_data
-    )
-    
-    # Check for errors
-    errors = root.findall(".//error")
-    if errors:
-        for err in errors:
-            code = err.get("code", "")
-            msg = err.text or err.findtext("message", "Unknown error")
-            print(f"Error [{code}]: {msg}", file=sys.stderr)
+    service = find_service_for_zone(args.zone)
+    if not service:
+        print(f"Zone {args.zone} not found.")
         sys.exit(1)
     
-    # Get created record ID
-    rr = root.find(".//rr")
-    record_id = rr.get("id") if rr is not None else "unknown"
-    
-    print(f"✓ Added {args.type} record: {args.name or '@'} -> {args.value}")
-    print(f"  Record ID: {record_id}")
-    print(f"  TTL: {args.ttl}")
-    print(f"\n⚠️  Run 'nic-dns commit {args.zone}' to apply changes!")
-
+    xml = build_rr_xml(args.type, args.name, args.value, args.ttl)
+    root = api_request("PUT", f"/services/{service}/zones/{args.zone}/records", data=xml)
+    print(f"✓ Added {args.type} {args.name or '@'} -> {args.value}")
 
 def cmd_delete(args):
-    """Delete a DNS record."""
-    root = api_request(
-        "DELETE",
-        f"/services/{args.zone}/zones/{args.zone}/records/{args.record_id}"
-    )
-    
-    errors = root.findall(".//error")
-    if errors:
-        for err in errors:
-            code = err.get("code", "")
-            msg = err.text or err.findtext("message", "Unknown error")
-            print(f"Error [{code}]: {msg}", file=sys.stderr)
+    service = find_service_for_zone(args.zone)
+    if not service:
+        print(f"Zone {args.zone} not found.")
         sys.exit(1)
     
-    print(f"✓ Deleted record {args.record_id} from {args.zone}")
-    print(f"\n⚠️  Run 'nic-dns commit {args.zone}' to apply changes!")
-
-
-def cmd_update(args):
-    """Update a DNS record value."""
-    # First get the existing record to preserve type and name
-    root = api_request("GET", f"/services/{args.zone}/zones/{args.zone}/records")
-    
-    target_rr = None
-    for rr in root.findall(".//rr"):
-        if rr.get("id") == args.record_id:
-            target_rr = rr
-            break
-    
-    if target_rr is None:
-        print(f"Error: Record {args.record_id} not found in zone {args.zone}", file=sys.stderr)
-        sys.exit(1)
-    
-    rtype = target_rr.findtext("type", "")
-    name = target_rr.findtext("name", "")
-    ttl = args.ttl or int(target_rr.findtext("ttl", "3600"))
-    
-    # Delete old and add new
-    api_request(
-        "DELETE",
-        f"/services/{args.zone}/zones/{args.zone}/records/{args.record_id}"
-    )
-    
-    xml_data = build_rr_xml(rtype, name, args.value, ttl)
-    api_request(
-        "PUT",
-        f"/services/{args.zone}/zones/{args.zone}/records",
-        data=xml_data
-    )
-    
-    print(f"✓ Updated record {args.record_id}: {name or '@'} -> {args.value}")
-    print(f"\n⚠️  Run 'nic-dns commit {args.zone}' to apply changes!")
-
+    api_request("DELETE", f"/services/{service}/zones/{args.zone}/records/{args.id}")
+    print(f"✓ Deleted record {args.id}")
 
 def cmd_commit(args):
-    """Commit pending changes to a zone."""
-    root = api_request(
-        "POST",
-        f"/services/{args.zone}/zones/{args.zone}/commit"
-    )
-    
-    errors = root.findall(".//error")
-    if errors:
-        for err in errors:
-            code = err.get("code", "")
-            msg = err.text or err.findtext("message", "Unknown error")
-            print(f"Error [{code}]: {msg}", file=sys.stderr)
-        sys.exit(1)
-    
-    print(f"✓ Changes committed for zone {args.zone}")
-    print("  DNS propagation may take a few minutes.")
+    service = find_service_for_zone(args.zone)
+    if not service:
+        print("Zone not found.")
+        return
+    api_request("POST", f"/services/{service}/zones/{args.zone}/commit")
+    print(f"✓ Committed {args.zone}")
 
-
-def cmd_rollback(args):
-    """Rollback uncommitted changes."""
-    root = api_request(
-        "POST",
-        f"/services/{args.zone}/zones/{args.zone}/rollback"
-    )
+def cmd_records(args):
+    service = find_service_for_zone(args.zone)
+    if not service:
+        print("Zone not found.")
+        return
     
-    errors = root.findall(".//error")
-    if errors:
-        for err in errors:
-            code = err.get("code", "")
-            msg = err.text or err.findtext("message", "Unknown error")
-            print(f"Error [{code}]: {msg}", file=sys.stderr)
-        sys.exit(1)
-    
-    print(f"✓ Rolled back uncommitted changes for zone {args.zone}")
-
+    root = api_request("GET", f"/services/{service}/zones/{args.zone}/records")
+    for rr in root.findall(".//rr"):
+        rid = rr.get("id")
+        rtype = rr.findtext("type")
+        name = rr.findtext("name") or "@"
+        
+        val = ""
+        if rtype == "A": val = rr.findtext("a")
+        elif rtype == "CNAME": val = rr.findtext("cname/name")
+        elif rtype == "MX": val = f"{rr.findtext('mx/preference')} {rr.findtext('mx/exchange')}"
+        elif rtype == "TXT": val = " ".join([t.text for t in rr.findall("txt/string")])
+        elif rtype == "NS": val = rr.findtext("ns")
+        elif rtype == "SRV": val = f"{rr.findtext('srv/priority')} {rr.findtext('srv/weight')} {rr.findtext('srv/port')} {rr.findtext('srv/target')}"
+        
+        print(f"{rid:<10} {rtype:<6} {name:<20} {val}")
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="NIC.RU DNS API CLI",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  nic-dns auth                          # Authenticate
-  nic-dns zones                         # List zones
-  nic-dns records example.ru            # List records
-  nic-dns add example.ru A www 1.2.3.4  # Add A record
-  nic-dns delete example.ru 12345       # Delete record
-  nic-dns commit example.ru             # Apply changes
-        """
-    )
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
     
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    add = sub.add_parser("add")
+    add.add_argument("zone")
+    add.add_argument("type")
+    add.add_argument("name")
+    add.add_argument("value")
+    add.add_argument("ttl", default=3600, nargs="?")
+    add.set_defaults(func=cmd_add)
     
-    # auth
-    auth_parser = subparsers.add_parser("auth", help="Authenticate and save token")
-    auth_parser.set_defaults(func=cmd_auth)
+    delete = sub.add_parser("delete")
+    delete.add_argument("zone")
+    delete.add_argument("id")
+    delete.set_defaults(func=cmd_delete)
     
-    # zones
-    zones_parser = subparsers.add_parser("zones", help="List DNS zones")
-    zones_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    zones_parser.set_defaults(func=cmd_zones)
+    cmt = sub.add_parser("commit")
+    cmt.add_argument("zone")
+    cmt.set_defaults(func=cmd_commit)
     
-    # records
-    records_parser = subparsers.add_parser("records", help="List zone records")
-    records_parser.add_argument("zone", help="Zone name (e.g., example.ru)")
-    records_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    records_parser.set_defaults(func=cmd_records)
+    recs = sub.add_parser("records")
+    recs.add_argument("zone")
+    recs.set_defaults(func=cmd_records)
     
-    # add
-    add_parser = subparsers.add_parser("add", help="Add DNS record")
-    add_parser.add_argument("zone", help="Zone name")
-    add_parser.add_argument("type", help="Record type (A, AAAA, CNAME, MX, TXT, NS, SRV)")
-    add_parser.add_argument("name", help="Record name (use @ for root)")
-    add_parser.add_argument("value", help="Record value")
-    add_parser.add_argument("ttl", type=int, nargs="?", default=3600, help="TTL in seconds (default: 3600)")
-    add_parser.set_defaults(func=cmd_add)
+    auth = sub.add_parser("auth")
+    auth.set_defaults(func=lambda x: get_token(True))
     
-    # delete
-    del_parser = subparsers.add_parser("delete", help="Delete DNS record")
-    del_parser.add_argument("zone", help="Zone name")
-    del_parser.add_argument("record_id", help="Record ID to delete")
-    del_parser.set_defaults(func=cmd_delete)
-    
-    # update
-    upd_parser = subparsers.add_parser("update", help="Update DNS record")
-    upd_parser.add_argument("zone", help="Zone name")
-    upd_parser.add_argument("record_id", help="Record ID to update")
-    upd_parser.add_argument("value", help="New value")
-    upd_parser.add_argument("--ttl", type=int, help="New TTL (optional)")
-    upd_parser.set_defaults(func=cmd_update)
-    
-    # commit
-    commit_parser = subparsers.add_parser("commit", help="Apply pending changes")
-    commit_parser.add_argument("zone", help="Zone name")
-    commit_parser.set_defaults(func=cmd_commit)
-    
-    # rollback
-    rollback_parser = subparsers.add_parser("rollback", help="Rollback uncommitted changes")
-    rollback_parser.add_argument("zone", help="Zone name")
-    rollback_parser.set_defaults(func=cmd_rollback)
-    
+    zones = sub.add_parser("zones")
+    zones.set_defaults(func=lambda x: print("Use 'nic-dns zones' original script for full list"))
+
     args = parser.parse_args()
     args.func(args)
-
 
 if __name__ == "__main__":
     main()
